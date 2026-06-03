@@ -16,6 +16,8 @@
 #define IOCTL_HM_GET_EVENTS   HYPERMON_IOCTL(0x800)  // Read pending events
 #define IOCTL_HM_CLEAR_EVENTS HYPERMON_IOCTL(0x801)  // Flush event queue
 #define IOCTL_HM_GET_COUNT    HYPERMON_IOCTL(0x802)  // How many events queued?
+#define IOCTL_HM_PROTECT_PID  HYPERMON_IOCTL(0x803)  // Set PID to protect
+#define IOCTL_HM_CHECK_ACTIVE HYPERMON_IOCTL(0x804)  // Is protection still active?
 
 #define HM_MAX_PATH     260
 #define HM_QUEUE_SIZE  4096   // Circular buffer capacity

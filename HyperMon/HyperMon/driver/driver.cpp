@@ -23,6 +23,13 @@ static PDEVICE_OBJECT g_Device     = nullptr;
 static LARGE_INTEGER  g_CmCookie   = {};
 static BOOLEAN        g_Registered = FALSE;
 
+// Protection globals
+static HANDLE         g_ProtectedPid  = NULL;
+static PVOID          g_ObRegistrationHandle = nullptr;
+static KTIMER         g_ProtectionTimer;
+static KDPC           g_ProtectionDpc;
+static PIO_WORKITEM   g_UnloadWorkItem = nullptr;
+
 // Circular event queue
 static HM_EVENT   g_Queue[HM_QUEUE_SIZE] = {};
 static ULONG      g_Head  = 0;   // next write slot
@@ -84,6 +91,68 @@ static void CopyUStr(wchar_t* dst, const UNICODE_STRING* src)
     SIZE_T bytes = min((SIZE_T)src->Length, (HM_MAX_PATH - 1) * sizeof(wchar_t));
     RtlCopyMemory(dst, src->Buffer, bytes);
     dst[bytes / sizeof(wchar_t)] = L'\0';
+}
+
+// ----------------------------------------------------------------
+//  Protection Callbacks (ObRegisterCallbacks)
+// ----------------------------------------------------------------
+
+static OB_PREOP_CALLBACK_STATUS PreCallback(PVOID RegistrationContext, POB_PRE_OPERATION_INFORMATION OperationInformation)
+{
+    UNREFERENCED_PARAMETER(RegistrationContext);
+
+    // Only protect if a PID is set
+    if (g_ProtectedPid == NULL)
+        return OB_PREOP_SUCCESS;
+
+    PEPROCESS targetProcess = (PEPROCESS)OperationInformation->Object;
+    HANDLE pid = PsGetProcessId(targetProcess);
+
+    if (pid == g_ProtectedPid) {
+        // If someone is trying to get a handle to our protected process
+        if (OperationInformation->ObjectType == *PsProcessType) {
+            // Strip terminate, write, and inject rights
+            OperationInformation->Parameters->CreateHandleInformation.DesiredAccess &= ~PROCESS_TERMINATE;
+            OperationInformation->Parameters->CreateHandleInformation.DesiredAccess &= ~PROCESS_VM_WRITE;
+            OperationInformation->Parameters->CreateHandleInformation.DesiredAccess &= ~PROCESS_VM_OPERATION;
+            OperationInformation->Parameters->CreateHandleInformation.DesiredAccess &= ~PROCESS_CREATE_THREAD;
+            OperationInformation->Parameters->CreateHandleInformation.DesiredAccess &= ~PROCESS_DUP_HANDLE;
+        }
+    }
+
+    return OB_PREOP_SUCCESS;
+}
+
+static VOID UnregisterWorkItem(PDEVICE_OBJECT DeviceObject, PVOID Context)
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+    UNREFERENCED_PARAMETER(Context);
+
+    if (g_ObRegistrationHandle) {
+        KdPrint(("[HyperMon] WorkItem: Unregistering callbacks at PASSIVE_LEVEL.\n"));
+        ObUnRegisterCallbacks(g_ObRegistrationHandle);
+        g_ObRegistrationHandle = nullptr;
+    }
+
+    g_ProtectedPid = NULL;
+}
+
+static VOID ProtectionTimerDpc(
+    _In_ struct _KDPC* Dpc,
+    _In_opt_ PVOID DeferredContext,
+    _In_opt_ PVOID SystemArgument1,
+    _In_opt_ PVOID SystemArgument2)
+{
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(DeferredContext);
+    UNREFERENCED_PARAMETER(SystemArgument1);
+    UNREFERENCED_PARAMETER(SystemArgument2);
+
+    KdPrint(("[HyperMon] 10 seconds elapsed. Queueing UnregisterWorkItem.\n"));
+
+    if (g_UnloadWorkItem) {
+        IoQueueWorkItem(g_UnloadWorkItem, UnregisterWorkItem, DelayedWorkQueue, nullptr);
+    }
 }
 
 // ----------------------------------------------------------------
@@ -244,6 +313,32 @@ static NTSTATUS Dispatch_IoControl(PDEVICE_OBJECT, PIRP Irp)
         break;
     }
 
+    case IOCTL_HM_PROTECT_PID: {
+        if (stack->Parameters.DeviceIoControl.InputBufferLength < sizeof(ULONG)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        g_ProtectedPid = UlongToHandle(*static_cast<ULONG*>(Irp->AssociatedIrp.SystemBuffer));
+        KdPrint(("[HyperMon] Protecting PID: %p\n", g_ProtectedPid));
+
+        // Start 10s timer to disable protection
+        LARGE_INTEGER dueTime;
+        dueTime.QuadPart = -100000000LL; // 10 seconds in 100ns intervals (negative = relative)
+        KeSetTimer(&g_ProtectionTimer, dueTime, &g_ProtectionDpc);
+        break;
+    }
+
+    case IOCTL_HM_CHECK_ACTIVE: {
+        if (stack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(BOOLEAN)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        *static_cast<BOOLEAN*>(Irp->AssociatedIrp.SystemBuffer) = (g_ProtectedPid != NULL);
+        info = sizeof(BOOLEAN);
+        break;
+    }
+
     default:
         status = STATUS_INVALID_DEVICE_REQUEST;
         break;
@@ -264,6 +359,16 @@ static VOID DriverUnload(PDRIVER_OBJECT DriverObject)
     UNREFERENCED_PARAMETER(DriverObject);
 
     KdPrint(("[HyperMon] Unloading...\n"));
+
+    if (g_UnloadWorkItem) {
+        IoFreeWorkItem(g_UnloadWorkItem);
+        g_UnloadWorkItem = nullptr;
+    }
+
+    if (g_ObRegistrationHandle) {
+        ObUnRegisterCallbacks(g_ObRegistrationHandle);
+        g_ObRegistrationHandle = nullptr;
+    }
 
     if (g_Registered) {
         // Order matters: unregister, then wait for callbacks to drain.
@@ -293,12 +398,22 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     KdPrint(("[HyperMon] Loading...\n"));
 
     KeInitializeSpinLock(&g_Lock);
+    KeInitializeTimer(&g_ProtectionTimer);
+    KeInitializeDpc(&g_ProtectionDpc, ProtectionTimerDpc, nullptr);
+
     DriverObject->DriverUnload = DriverUnload;
 
     // Dispatch table
     DriverObject->MajorFunction[IRP_MJ_CREATE]         = Dispatch_CreateClose;
     DriverObject->MajorFunction[IRP_MJ_CLOSE]          = Dispatch_CreateClose;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = Dispatch_IoControl;
+
+    // ----- Create Work Item for safe unregistration -----
+    g_UnloadWorkItem = IoAllocateWorkItem(DriverObject);
+    if (!g_UnloadWorkItem) {
+        KdPrint(("[HyperMon] IoAllocateWorkItem failed.\n"));
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
 
     // ----- Create kernel device -----
     UNICODE_STRING devName = RTL_CONSTANT_STRING(HYPERMON_DEVICE_NAME);
@@ -353,6 +468,28 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         PsRemoveCreateThreadNotifyRoutine(CB_Thread);
         PsRemoveLoadImageNotifyRoutine(CB_ImageLoad);
         goto Cleanup;
+    }
+
+    // ----- Register Object Callbacks for protection -----
+    OB_CALLBACK_REGISTRATION obReg = {};
+    OB_OPERATION_REGISTRATION opReg = {};
+
+    opReg.ObjectType = PsProcessType;
+    opReg.Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
+    opReg.PreOperation = PreCallback;
+    opReg.PostOperation = nullptr;
+
+    obReg.Version = OB_FLT_REGISTRATION_VERSION;
+    obReg.OperationRegistrationCount = 1;
+    obReg.RegistrationContext = nullptr;
+    RtlInitUnicodeString(&obReg.Altitude, L"388888");
+    obReg.OperationRegistration = &opReg;
+
+    status = ObRegisterCallbacks(&obReg, &g_ObRegistrationHandle);
+    if (!NT_SUCCESS(status)) {
+        KdPrint(("[HyperMon] ObRegisterCallbacks failed: 0x%08X\n", status));
+        // We don't fail DriverEntry for this, just log it
+        g_ObRegistrationHandle = nullptr;
     }
 
     g_Registered = TRUE;
