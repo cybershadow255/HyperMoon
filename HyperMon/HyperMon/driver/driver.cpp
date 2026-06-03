@@ -360,7 +360,11 @@ static VOID DriverUnload(PDRIVER_OBJECT DriverObject)
 
     KdPrint(("[HyperMon] Unloading...\n"));
 
+    // Cancel timer to prevent DPC from running after driver is gone
+    KeCancelTimer(&g_ProtectionTimer);
+
     if (g_UnloadWorkItem) {
+        // In a real driver, you'd wait for the work item to complete if it's pending.
         IoFreeWorkItem(g_UnloadWorkItem);
         g_UnloadWorkItem = nullptr;
     }

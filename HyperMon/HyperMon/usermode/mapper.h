@@ -26,9 +26,16 @@ public:
         std::cout << "[!] INFO: Ein vollwertiger Manual Mapper (wie kdmapper) sollte hier integriert werden," << std::endl;
         std::cout << "    um die Signaturpruefung ohne Testsigning-Modus zu umgehen." << std::endl;
 
-        // In der Praxis wuerde hier der Aufruf an die Mapper-Library stehen.
-        // Da wir fuer 'Robustheit' stehen, ist die Empfehlung, ein bewaehrtes Tool zu nutzen.
+        /*
+           BEISPIEL FUER DIE INTEGRATION VON KDMAPPER:
+           ------------------------------------------
+           std::string command = "kdmapper.exe " + std::string(driverPath.begin(), driverPath.end());
+           int result = system(command.c_str());
+           return (result == 0);
+        */
 
-        return false; // Stub
+        std::cout << "[*] HINWEIS: Kopiere 'kdmapper.exe' in diesen Ordner fuer volle PnP-Funktionalitaet." << std::endl;
+
+        return false; // Stub - Erfordert kdmapper.exe im Pfad
     }
 };
